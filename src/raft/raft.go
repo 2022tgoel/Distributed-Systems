@@ -23,7 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"fmt"
+	// "fmt"
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -167,6 +167,7 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Your code here (2A, 2B)
 	if args.Term > rf.currentTerm { 
 		// Advance the term:
@@ -189,12 +190,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true;
 		rf.votedFor = args.CandidateId
 		rf.resetElectionTimer()
-		fmt.Printf("%d giving vote to %d\n", rf.me, args.CandidateId);
 	} else {
-		fmt.Printf("%d not giving vote to %d\n", rf.me, args.CandidateId);
 		reply.VoteGranted = false;
 	}
-	rf.mu.Unlock()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -225,7 +223,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	fmt.Printf("%d asked %d\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -243,6 +240,7 @@ type AppendEntriesReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.position = Follower
@@ -256,7 +254,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		reply.Success = false
 	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -268,7 +265,9 @@ func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
 		rf.mu.Lock()
 		term := rf.currentTerm
-		if rf.position == Leader {
+		isleader := rf.position == Leader
+		rf.mu.Unlock()
+		if isleader {
 			for i := 0; i < len(rf.peers); i+=1 {
 				if i != rf.me {
 					go func(i int) {
@@ -277,7 +276,6 @@ func (rf *Raft) heartbeat() {
 				}
 			}
 		}
-		rf.mu.Unlock()
 		// pause for 100 milliseconds
 		// the network is limited to only being able to send tens of heartbeats a second
 		ms := 100
@@ -314,13 +312,13 @@ func (rf *Raft) requestVotes() {
 	rf.mu.Lock()
 	if rf.position == Leader { 
 		// do not start a new term if you are already the leader
+		rf.mu.Unlock()
 		return
 	}
 	rf.currentTerm += 1
 	rf.position = Candidate
 	// Term and index of last log entry is set to 0 because we don't support adding log entries yet
 	args := RequestVoteArgs{rf.currentTerm, rf.me, 0, 0}
-	fmt.Printf("%d trying to win an election of term %d\n", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 	// votes for itself
 	rf.votedFor = rf.me
@@ -344,20 +342,21 @@ func (rf *Raft) requestVotes() {
 		}
 	}
 
-	for votes <= int32(len(rf.peers) / 2) && completed < int32(len(rf.peers) - 1) {
-		// fmt.Printf("here2 %d %d\n", votes, completed)
+	for rf.currentTerm == args.Term && votes <= int32(len(rf.peers) / 2) && completed < int32(len(rf.peers) - 1) { 
+		// polling approach to checking if you have won he election
 		// wait to either have enough votes or to have gotten everyone's response
+		time.Sleep(time.Duration(20) * time.Millisecond)
 	}
 	rf.mu.Lock()
 	if rf.currentTerm != args.Term {
 		// the term changed in some other goroutine while we were collecting votes
+		rf.mu.Unlock()
 		return
 	}
 	// If it gets a majority of votes, it becomes the leader
 	if votes > int32(len(rf.peers) / 2) {
 		rf.position = Leader
 	} else {
-		// fmt.Printf("%d failed to get elected\n", rf.me)
 		rf.position = Follower // failed to get elected
 	}
 	rf.mu.Unlock()
@@ -383,13 +382,11 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	// time.Sleep(time.Duration(ms) * time.Millisecond)
-	// fmt.Printf("%d\n", ms)
 	for rf.killed() == false {
 
 		// Your code here (2A)
 		atomic.StoreInt64(&rf.electionTimer, 0)
-		ms := 550 + (rand.Int63() % 1000) 
+		ms := 850 + (rand.Int63() % 600)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		if atomic.LoadInt64(&rf.electionTimer) == 0 {
 			go rf.requestVotes()

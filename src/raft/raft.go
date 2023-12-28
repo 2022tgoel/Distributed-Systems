@@ -57,6 +57,10 @@ const (  // iota is reset to 0
 	Leader = iota  // c2 == 2
 )
 
+type LogEntry struct {
+	term 	int
+	command interface{}
+}
 
 
 // A Go object implementing a single Raft peer.
@@ -76,7 +80,11 @@ type Raft struct {
 	currentTerm		int
 	votedFor		int
 	electionTimer	int64
-	// log			[]
+
+	// Logging
+	nextIndex		[]int
+	matchIndex		[]int
+	log				[]LogEntry
 }
 
 // return currentTerm and whether this server
@@ -186,7 +194,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2) the server must be follower to be able to give a vote
 	// 3) the server must have an available vote
 	// 4) the server's log must be up-to-date (handled in a later part)
-	if args.Term == rf.currentTerm && rf.position == Follower && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) { // && (args.lastLogTerm > || args.lastLogTerm == rf. && args.lastLogIndex > rf.) {
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].term
+	if args.Term == rf.currentTerm && rf.position == Follower && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && (args.LastLogTerm > lastLogTerm || args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 		reply.VoteGranted = true;
 		rf.votedFor = args.CandidateId
 		rf.resetElectionTimer()
@@ -229,7 +239,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 
 type AppendEntriesArgs struct {
-	Term	int
+	Term			int
+	LeaderCommit	int
+	PrevLogIndex	int
+	PrevLogTerm		int
+	Command 		interface{}
 }
 
 type AppendEntriesReply struct {
@@ -250,7 +264,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term == rf.currentTerm {
 		// Reset the election timeout
 		rf.resetElectionTimer()
-		reply.Success = true
+		if args.Command != nil { // not a heartbeat
+			if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].term != args.PrevLogTerm {
+				reply.Success = false
+			} else {
+				rf.log = rf.log[:args.PrevLogIndex+1]
+				rf.log = append(rf.log, LogEntry{args.Term, args.Command})
+				if args.LeaderCommit > rf.commitIndex {
+					rf.commitIndex = args.LeaderCommit
+				}
+				reply.Success = true
+			}
+		} else { // is a heartbeat
+			reply.Success = true
+		}
 	} else {
 		reply.Success = false
 	}
@@ -271,7 +298,7 @@ func (rf *Raft) heartbeat() {
 			for i := 0; i < len(rf.peers); i+=1 {
 				if i != rf.me {
 					go func(i int) {
-						rf.sendAppendEntries(i, &AppendEntriesArgs{term}, &AppendEntriesReply{})
+						rf.sendAppendEntries(i, &AppendEntriesArgs{term, 0, 0, 0, nil}, &AppendEntriesReply{})
 					}(i)
 				}
 			}
@@ -283,6 +310,10 @@ func (rf *Raft) heartbeat() {
 	}
 }
 
+
+func (rf *Raft) requestPeerStart(server int) {
+	
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -297,12 +328,24 @@ func (rf *Raft) heartbeat() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	index := len(rf.log)
+	term := rf.currentTerm
+	isLeader := rf.position == Leader
+	rf.mu.Unlock()
 
 	// Your code here (2B).
+	if isLeader {
+		// add the entry to the log
+		rf.log = append(rf.log, LogEntry{term, command})
+		// tell all the other servers to add the entry to their log
+		for i := 0; i < len(rf.peers); i += 1 {
+			if i != rf.me {
+ 				// go requestPeerStart(i)
+			}
+		}
 
+	}
 
 	return index, term, isLeader
 }
@@ -318,7 +361,9 @@ func (rf *Raft) requestVotes() {
 	rf.currentTerm += 1
 	rf.position = Candidate
 	// Term and index of last log entry is set to 0 because we don't support adding log entries yet
-	args := RequestVoteArgs{rf.currentTerm, rf.me, 0, 0}
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].term
+	args := RequestVoteArgs{rf.currentTerm, rf.me, lastLogIndex, lastLogTerm}
 	rf.mu.Unlock()
 	// votes for itself
 	rf.votedFor = rf.me
@@ -356,6 +401,11 @@ func (rf *Raft) requestVotes() {
 	// If it gets a majority of votes, it becomes the leader
 	if votes > int32(len(rf.peers) / 2) {
 		rf.position = Leader
+		// reset nextIndex and matchIndex
+		for i := 0; i < len(rf.peers); i += 1 {
+			rf.nextIndex[i] = len(rf.log)
+			rf.matchIndex[i] = 0
+		}
 	} else {
 		rf.position = Follower // failed to get elected
 	}
@@ -386,7 +436,7 @@ func (rf *Raft) ticker() {
 
 		// Your code here (2A)
 		atomic.StoreInt64(&rf.electionTimer, 0)
-		ms := 850 + (rand.Int63() % 600)
+		ms := 550 + (rand.Int63() % 600)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		if atomic.LoadInt64(&rf.electionTimer) == 0 {
 			go rf.requestVotes()
@@ -415,6 +465,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.currentTerm = 0
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	// The actual log entries should start with positive indices.
+	// Put a dummy entry in the first position so that this is easy. 
+	rf.log = make([]LogEntry, 1)
+	rf.log[0] = LogEntry{0, nil}
 	go rf.heartbeat()
 
 	// initialize from state persisted before a crash

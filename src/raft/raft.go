@@ -244,6 +244,7 @@ type AppendEntriesArgs struct {
 	LeaderCommit	int
 	PrevLogIndex	int
 	PrevLogTerm		int
+	CommandTerm		int
 	Command 		interface{}
 }
 
@@ -271,7 +272,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else {
 				// fmt.Printf("%d adding log entry %d\n", rf.me, args.PrevLogIndex + 1)
 				rf.log = rf.log[:args.PrevLogIndex+1]
-				rf.log = append(rf.log, LogEntry{args.Term, args.Command})
+				rf.log = append(rf.log, LogEntry{args.CommandTerm, args.Command})
 				reply.Success = true
 			}
 		} else { // is a heartbeat
@@ -305,7 +306,7 @@ func (rf *Raft) heartbeat() {
 			for i := 0; i < len(rf.peers); i+=1 {
 				if i != rf.me {
 					go func(i int) {
-						rf.sendAppendEntries(i, &AppendEntriesArgs{term, committed, 0, 0, nil}, &AppendEntriesReply{})
+						rf.sendAppendEntries(i, &AppendEntriesArgs{term, committed, 0, 0, 0, nil}, &AppendEntriesReply{})
 					}(i)
 				}
 			}
@@ -319,19 +320,22 @@ func (rf *Raft) heartbeat() {
 
 // tells the other servers to add the log entry
 func (rf *Raft) requestPeerStart(server int) {
-	for rf.nextIndex[server] >= len(rf.log) || rf.position != Leader {
+	for rf.killed() == false && rf.nextIndex[server] >= len(rf.log) || rf.position != Leader {
 		time.Sleep(time.Duration(10) * time.Millisecond)
+	}
+	if rf.killed() {
+		return
 	}
 	rf.mu.Lock()
 	term := rf.currentTerm
 	logIndex := rf.nextIndex[server]
 	if logIndex >= len(rf.log) || rf.position != Leader {
 		rf.mu.Unlock()
-		go rf.requestPeerStart(server)
+		rf.requestPeerStart(server)
 		return
 	}
 	// fmt.Printf("%d is sending out %d to %d\n", rf.me, logIndex, server)
-	args := AppendEntriesArgs{term, rf.commitIndex, logIndex - 1, rf.log[logIndex - 1].term, rf.log[logIndex].command}
+	args := AppendEntriesArgs{term, rf.commitIndex, logIndex - 1, rf.log[logIndex - 1].term, rf.log[logIndex].term, rf.log[logIndex].command}
 	rf.mu.Unlock()
 	// can try sending the message
 	reply := AppendEntriesReply{}
@@ -362,7 +366,7 @@ func (rf *Raft) requestPeerStart(server int) {
 		}
 	}
 	rf.mu.Unlock()
-	go rf.requestPeerStart(server)
+	rf.requestPeerStart(server)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start

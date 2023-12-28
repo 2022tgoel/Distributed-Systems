@@ -85,6 +85,7 @@ type Raft struct {
 	nextIndex		[]int
 	matchIndex		[]int
 	log				[]LogEntry
+	applyCh			chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -268,15 +269,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].term != args.PrevLogTerm {
 				reply.Success = false
 			} else {
+				// fmt.Printf("%d adding log entry %d\n", rf.me, args.PrevLogIndex + 1)
 				rf.log = rf.log[:args.PrevLogIndex+1]
 				rf.log = append(rf.log, LogEntry{args.Term, args.Command})
-				if args.LeaderCommit > rf.commitIndex {
-					rf.commitIndex = args.LeaderCommit
-				}
 				reply.Success = true
 			}
 		} else { // is a heartbeat
 			reply.Success = true
+		}
+		if args.LeaderCommit > rf.commitIndex && args.LeaderCommit < len(rf.log) && rf.log[args.LeaderCommit].term == rf.currentTerm {
+			for i := rf.commitIndex + 1; i <= args.LeaderCommit; i += 1 {
+				rf.applyCh<-ApplyMsg{true, rf.log[i].command, i, false, nil, 0, 0}
+			}
+			// fmt.Printf("%d increased commit to %d value: %v\n", rf.me, args.LeaderCommit, rf.log[args.LeaderCommit].command)
+			rf.commitIndex = args.LeaderCommit
 		}
 	} else {
 		reply.Success = false
@@ -292,13 +298,14 @@ func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
 		rf.mu.Lock()
 		term := rf.currentTerm
+		committed := rf.commitIndex
 		isleader := rf.position == Leader
 		rf.mu.Unlock()
 		if isleader {
 			for i := 0; i < len(rf.peers); i+=1 {
 				if i != rf.me {
 					go func(i int) {
-						rf.sendAppendEntries(i, &AppendEntriesArgs{term, 0, 0, 0, nil}, &AppendEntriesReply{})
+						rf.sendAppendEntries(i, &AppendEntriesArgs{term, committed, 0, 0, nil}, &AppendEntriesReply{})
 					}(i)
 				}
 			}
@@ -310,9 +317,52 @@ func (rf *Raft) heartbeat() {
 	}
 }
 
-
+// tells the other servers to add the log entry
 func (rf *Raft) requestPeerStart(server int) {
-	
+	for rf.nextIndex[server] >= len(rf.log) || rf.position != Leader {
+		time.Sleep(time.Duration(10) * time.Millisecond)
+	}
+	rf.mu.Lock()
+	term := rf.currentTerm
+	logIndex := rf.nextIndex[server]
+	if logIndex >= len(rf.log) || rf.position != Leader {
+		rf.mu.Unlock()
+		go rf.requestPeerStart(server)
+		return
+	}
+	// fmt.Printf("%d is sending out %d to %d\n", rf.me, logIndex, server)
+	args := AppendEntriesArgs{term, rf.commitIndex, logIndex - 1, rf.log[logIndex - 1].term, rf.log[logIndex].command}
+	rf.mu.Unlock()
+	// can try sending the message
+	reply := AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	rf.mu.Lock()
+	if rf.currentTerm == reply.Term {
+		if ok && reply.Success {
+			rf.matchIndex[server] = rf.nextIndex[server]
+			if rf.matchIndex[server] > rf.commitIndex && rf.log[rf.matchIndex[server]].term == rf.currentTerm {
+				matches := 1
+				for i := 0; i < len(rf.peers); i+=1 {
+					if i != rf.me && rf.matchIndex[i] >= rf.matchIndex[server] {
+						matches++
+					}
+				}
+				if matches > len(rf.peers) / 2 {
+					for i := rf.commitIndex + 1; i <= rf.matchIndex[server]; i += 1 {
+						rf.applyCh<-ApplyMsg{true, rf.log[i].command, i, false, nil, 0, 0}
+					}
+					rf.commitIndex = rf.matchIndex[server]
+					// fmt.Printf("%d increment commit %d\n", rf.me, rf.commitIndex)
+				}
+			}
+			rf.nextIndex[server]++
+			
+		} else {
+			rf.nextIndex[server]--
+		}
+	}
+	rf.mu.Unlock()
+	go rf.requestPeerStart(server)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -329,22 +379,15 @@ func (rf *Raft) requestPeerStart(server int) {
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := len(rf.log)
 	term := rf.currentTerm
 	isLeader := rf.position == Leader
-	rf.mu.Unlock()
 
 	// Your code here (2B).
 	if isLeader {
 		// add the entry to the log
 		rf.log = append(rf.log, LogEntry{term, command})
-		// tell all the other servers to add the entry to their log
-		for i := 0; i < len(rf.peers); i += 1 {
-			if i != rf.me {
- 				// go requestPeerStart(i)
-			}
-		}
-
 	}
 
 	return index, term, isLeader
@@ -467,12 +510,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.applyCh = applyCh
 	// The actual log entries should start with positive indices.
 	// Put a dummy entry in the first position so that this is easy. 
 	rf.log = make([]LogEntry, 1)
 	rf.log[0] = LogEntry{0, nil}
 	go rf.heartbeat()
-
+	for i := 0; i < len(rf.peers); i+=1 {
+		if i != rf.me {
+			go rf.requestPeerStart(i)
+		}
+	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 

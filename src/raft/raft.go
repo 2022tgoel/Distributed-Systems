@@ -150,7 +150,6 @@ func (rf *Raft) persist() {
 	e.Encode(rf.snapshotIndex)
 	e.Encode(rf.snapshotTerm)
 	raftstate := w.Bytes()
-	DebugPrintf("%d saving persistent state: %d bytes, %d map\n", rf.me, len(raftstate), len(rf.log))
 	rf.persister.Save(raftstate, rf.snapshot)
 }
 
@@ -201,6 +200,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		delete(rf.log, i)
 	}
 	rf.snapshotIndex = index
+	
 }
 
 // example RequestVote RPC arguments structure.
@@ -234,7 +234,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.snapshotIndex = args.LastIncludedIndex
 		rf.snapshotTerm = args.LastIncludedTerm
 		rf.snapshot = args.Data
-		DebugPrintf("%d applying snapshot %d\n", rf.me, rf.snapshotIndex)
 		rf.applyCh<-ApplyMsg{false, nil, 0, true, rf.snapshot, rf.snapshotTerm, rf.snapshotIndex}
 		rf.log = make(map[int]LogEntry)
 		rf.commitIndex = rf.snapshotIndex
@@ -352,9 +351,9 @@ type AppendEntriesReply struct {
 
 // example RequestVote RPC handler.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DebugPrintf("%d command 1\n", rf.me)
+	// DebugPrintf("%d command 1\n", rf.me)
 	rf.mu.Lock()
-	DebugPrintf("%d command 2\n", rf.me)
+	// DebugPrintf("%d command 2\n", rf.me)
 	defer rf.mu.Unlock()
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
@@ -391,12 +390,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = true
 		}
 		if args.LeaderCommit > rf.commitIndex && args.LeaderCommit <= rf.lastLogIndex() && rf.log[args.LeaderCommit].Term == rf.currentTerm {
-			for i := rf.commitIndex + 1; i <= args.LeaderCommit; i += 1 {
-				DebugPrintf("%d applying %d(data:%d)\n", rf.me, i, rf.log[i].Command)
-				rf.applyCh<-ApplyMsg{true, rf.log[i].Command, i, false, nil, 0, 0}
-				DebugPrintf("%d done applying %d(data:%d)\n", rf.me, i, rf.log[i].Command)
-			}
+			start := rf.commitIndex + 1
 			rf.commitIndex = args.LeaderCommit
+			for i := start; i <= args.LeaderCommit; i += 1 {
+				msg := ApplyMsg{true, rf.log[i].Command, i, false, nil, 0, 0}
+				rf.mu.Unlock()
+				// Cannot be holding the lock while sending the message, so that 
+				// Snapshot() has an opportunity to grab the lock
+				rf.applyCh<-msg
+				rf.mu.Lock()
+			}
 		}
 	} else {
 		reply.Success = false
@@ -422,7 +425,6 @@ func (rf *Raft) heartbeat() {
 						reply := AppendEntriesReply{}
 						ok := rf.sendAppendEntries(i, &AppendEntriesArgs{term, committed, 0, 0, 0, nil}, &reply)
 						rf.mu.Lock()
-						// DebugPrintf("%d received heartbeat response from %d data: %t %d %d %d %d %d\n", rf.me, i, ok, reply.Term, reply.XIndex, reply.XTerm, reply.XLen, rf.currentTerm)
 						if ok && reply.Term > rf.currentTerm {
 							rf.becomeFollower(reply.Term)	
 						}
@@ -441,9 +443,6 @@ func (rf *Raft) heartbeat() {
 func (rf *Raft) requestPeerStart(server int) {
 	for rf.killed() == false && rf.nextIndex[server] > rf.lastLogIndex() || rf.position != Leader {
 		time.Sleep(time.Duration(10) * time.Millisecond)
-		if rf.position == Leader {
-			DebugPrintf("%d fdjskfs %d %d %d\n", rf.me, server, rf.nextIndex[server], rf.lastLogIndex())
-		}
 	}
 	if rf.killed() {
 		return
@@ -472,6 +471,7 @@ func (rf *Raft) requestPeerStart(server int) {
 		DebugPrintf("%d received response from %d\n", rf.me, server)
 		if ok {
 			rf.mu.Lock()
+			DebugPrintf("%d received response from %d\n", rf.me, server)
 			if rf.currentTerm == args.Term && rf.currentTerm == reply.Term {
 				if reply.Success {
 					rf.matchIndex[server] = rf.nextIndex[server]
@@ -483,10 +483,14 @@ func (rf *Raft) requestPeerStart(server int) {
 							}
 						}
 						if matches > len(rf.peers) / 2 {
-							for i := rf.commitIndex + 1; i <= rf.matchIndex[server]; i += 1 {
-								rf.applyCh<-ApplyMsg{true, rf.log[i].Command, i, false, nil, 0, 0}
-							}
+							start := rf.commitIndex + 1
 							rf.commitIndex = rf.matchIndex[server]
+							for i := start; i <= rf.matchIndex[server]; i += 1 {
+								msg := ApplyMsg{true, rf.log[i].Command, i, false, nil, 0, 0}
+								rf.mu.Unlock()
+								rf.applyCh<-msg
+								rf.mu.Lock()
+							}
 						}
 					}
 					rf.nextIndex[server]++
@@ -524,6 +528,7 @@ func (rf *Raft) requestPeerStart(server int) {
 			rf.mu.Lock()
 			if rf.currentTerm == args.Term && rf.currentTerm == reply.Term {
 				rf.nextIndex[server] = args.LastIncludedIndex + 1
+				rf.matchIndex[server] = args.LastIncludedIndex
 			} else if reply.Term > rf.currentTerm {
 				rf.becomeFollower(reply.Term)
 			}
